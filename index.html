@@ -9,10 +9,6 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Playfair+Display:ital,wght@0,600;1,400&display=swap" rel="stylesheet">
-    
-    <!-- MediaPipe Pose CDN (Classic build) -->
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
 
     <style>
         :root {
@@ -265,7 +261,7 @@
 
     <main>
         <canvas id="shadowCanvas"></canvas>
-        <video id="webcam" autoplay playsinline></video>
+        <video id="webcam" autoplay playsinline muted></video>
 
         <!-- Right Slide-out Panel -->
         <div class="side-panel" id="sidePanel">
@@ -309,198 +305,182 @@
         </div>
     </main>
 
-    <script>
-        const video = document.getElementById('webcam');
-        const canvas = document.getElementById('shadowCanvas');
-        const ctx = canvas.getContext('2d');
-        const btnCamera = document.getElementById('btnCamera');
-        const statusDot = document.getElementById('statusDot');
-        const statusText = document.getElementById('statusText');
-        const cardText = document.getElementById('cardText');
-        const toggleSkeletonBtn = document.getElementById('toggleSkeleton');
-        const toggleIDBtn = document.getElementById('toggleID');
+    <!-- ES module: works correctly on GitHub Pages (proper MIME types) -->
+    <script type="module">
+        import { PoseLandmarker, FilesetResolver } from
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+        const video        = document.getElementById('webcam');
+        const canvas       = document.getElementById('shadowCanvas');
+        const ctx          = canvas.getContext('2d');
+        const btnCamera    = document.getElementById('btnCamera');
+        const statusDot    = document.getElementById('statusDot');
+        const statusText   = document.getElementById('statusText');
+        const cardText     = document.getElementById('cardText');
+        const toggleSkeletonBtn  = document.getElementById('toggleSkeleton');
+        const toggleIDBtn        = document.getElementById('toggleID');
         const toggleWallColorBtn = document.getElementById('toggleWallColor');
-        const blurSlider = document.getElementById('blurSlider');
+        const blurSlider    = document.getElementById('blurSlider');
         const densitySlider = document.getElementById('densitySlider');
-        const scaleSlider = document.getElementById('scaleSlider');
-        const menuBtn = document.getElementById('menuBtn');
+        const scaleSlider   = document.getElementById('scaleSlider');
+        const menuBtn   = document.getElementById('menuBtn');
         const sidePanel = document.getElementById('sidePanel');
 
-        let pose;
-        let camera = null;
-        let webcamRunning = false;
+        let poseLandmarker = null;
+        let webcamRunning  = false;
+        let stream         = null;
+        let rafId          = null;
 
         // Track memory to persist Person IDs across frames using horizontal coordinates (X)
         let activeTracks = []; // array of { x: number, id: number, lastSeen: number }
-        let nextTrackId = 1;
+        let nextTrackId  = 1;
 
-        // Toggle Right Panel
+        // Customization states
+        let showSkeleton  = true;
+        let showID        = true;
+        let wallWarmTheme = false;
+        let shadowBlur    = 12;
+        let shadowOpacity = 0.9;
+        let shadowScale   = 1.0;
+
+        // ─── Toggle Right Panel ────────────────────────────────────────────────
         menuBtn.addEventListener('click', () => {
             menuBtn.classList.toggle('open');
             sidePanel.classList.toggle('open');
         });
 
-        // Customization states
-        let showSkeleton = true;
-        let showID = true;
-        let wallWarmTheme = false;
-        let shadowBlur = 12;
-        let shadowOpacity = 0.9;
-        let shadowScale = 1.0;
-
-        // Initialize MediaPipe Pose
-        function initPose() {
+        // ─── Initialize MediaPipe PoseLandmarker (numPoses: 2) ────────────────
+        async function initPose() {
             try {
                 statusText.innerText = "Loading Pose models...";
-                pose = new Pose({
-                    locateFile: (file) => {
-                        return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
-                    }
-                });
 
-                pose.setOptions({
-                    modelComplexity: 1,
-                    smoothLandmarks: true,
-                    enableSegmentation: true,
-                    smoothSegmentation: true,
-                    minDetectionConfidence: 0.5,
-                    minTrackingConfidence: 0.5
-                });
+                const filesetResolver = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+                );
 
-                pose.onResults(onPoseResults);
+                poseLandmarker = await PoseLandmarker.createFromOptions(filesetResolver, {
+                    baseOptions: {
+                        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO",
+                    numPoses: 2,
+                    minPoseDetectionConfidence: 0.5,
+                    minPosePresenceConfidence: 0.5,
+                    minTrackingConfidence: 0.5,
+                    outputSegmentationMasks: true
+                });
 
                 statusText.innerText = "Models Loaded";
                 statusDot.classList.add('active');
             } catch (err) {
-                console.error("Failed to load Pose:", err);
+                console.error("Failed to load PoseLandmarker:", err);
                 statusText.innerText = "Model load failed";
             }
         }
 
-        // Initialize App
         initPose();
 
-        // Toggle Webcam
+        // ─── Detection loop (replaces camera_utils Camera class) ──────────────
+        function detectLoop() {
+            if (!webcamRunning) return;
+            if (video.readyState >= 2 && poseLandmarker) {
+                const nowMs = performance.now();
+                const results = poseLandmarker.detectForVideo(video, nowMs);
+                onPoseResults(results);
+            }
+            rafId = requestAnimationFrame(detectLoop);
+        }
+
+        // ─── Toggle Webcam ────────────────────────────────────────────────────
         async function toggleWebcam() {
-            if (!pose) {
+            if (!poseLandmarker) {
                 alert("Please wait for the models to finish loading.");
                 return;
             }
 
             if (webcamRunning) {
+                // Stop
                 webcamRunning = false;
+                cancelAnimationFrame(rafId);
+                if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+                video.srcObject = null;
+
                 btnCamera.innerText = "Start Camera";
                 btnCamera.classList.remove('active');
                 statusDot.classList.remove('active');
                 statusText.innerText = "Camera Stopped";
                 cardText.innerText = "Turn on the camera to see your shadows cast on the wall.";
-                
-                if (camera) {
-                    await camera.stop();
-                    camera = null;
-                }
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
             } else {
+                // Start
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }
+                    });
+                    video.srcObject = stream;
+                    await video.play();
+                } catch (err) {
+                    console.error("Webcam access denied:", err);
+                    statusText.innerText = "Camera Access Denied";
+                    return;
+                }
+
                 webcamRunning = true;
                 btnCamera.innerText = "Stop Camera";
                 btnCamera.classList.add('active');
                 statusDot.classList.add('active');
                 statusText.innerText = "Camera Active";
-                cardText.innerText = "Move around! Step back so your body is visible to cast a complete shadow figurine.";
+                cardText.innerText = "Move around! Two people can cast shadows simultaneously.";
 
-                camera = new Camera(video, {
-                    onFrame: async () => {
-                        if (webcamRunning) {
-                            await pose.send({ image: video });
-                        }
-                    },
-                    width: 1280,
-                    height: 720
-                });
-                
-                try {
-                    await camera.start();
-                } catch (err) {
-                    console.error("Webcam access denied:", err);
-                    statusText.innerText = "Camera Access Denied";
-                    statusDot.classList.remove('active');
-                    webcamRunning = false;
-                    btnCamera.innerText = "Start Camera";
-                }
+                detectLoop();
             }
         }
 
         btnCamera.addEventListener("click", toggleWebcam);
 
-        // UI Interactions
+        // ─── UI Interactions ──────────────────────────────────────────────────
         toggleSkeletonBtn.addEventListener("click", () => {
             showSkeleton = !showSkeleton;
-            if (showSkeleton) {
-                toggleSkeletonBtn.innerText = "Skeleton: On";
-                toggleSkeletonBtn.classList.add('enabled');
-            } else {
-                toggleSkeletonBtn.innerText = "Skeleton: Off";
-                toggleSkeletonBtn.classList.remove('enabled');
-            }
+            toggleSkeletonBtn.innerText = showSkeleton ? "Skeleton: On" : "Skeleton: Off";
+            toggleSkeletonBtn.classList.toggle('enabled', showSkeleton);
         });
 
         toggleIDBtn.addEventListener("click", () => {
             showID = !showID;
-            if (showID) {
-                toggleIDBtn.innerText = "Person ID: On";
-                toggleIDBtn.classList.add('enabled');
-            } else {
-                toggleIDBtn.innerText = "Person ID: Off";
-                toggleIDBtn.classList.remove('enabled');
-            }
+            toggleIDBtn.innerText = showID ? "Person ID: On" : "Person ID: Off";
+            toggleIDBtn.classList.toggle('enabled', showID);
         });
 
         toggleWallColorBtn.addEventListener("click", () => {
             wallWarmTheme = !wallWarmTheme;
-            if (wallWarmTheme) {
-                canvas.style.background = "var(--wall-bg-warm)";
-                toggleWallColorBtn.innerText = "Cool Light";
-            } else {
-                canvas.style.background = "var(--wall-bg-light)";
-                toggleWallColorBtn.innerText = "Warm Light";
-            }
+            canvas.style.background = wallWarmTheme ? "var(--wall-bg-warm)" : "var(--wall-bg-light)";
+            toggleWallColorBtn.innerText = wallWarmTheme ? "Cool Light" : "Warm Light";
         });
 
-        blurSlider.addEventListener("input", (e) => {
-            shadowBlur = parseInt(e.target.value);
-        });
+        blurSlider.addEventListener("input",    (e) => { shadowBlur    = parseInt(e.target.value); });
+        densitySlider.addEventListener("input", (e) => { shadowOpacity = parseFloat(e.target.value) / 100; });
+        scaleSlider.addEventListener("input",   (e) => { shadowScale   = parseFloat(e.target.value) / 100; });
 
-        densitySlider.addEventListener("input", (e) => {
-            shadowOpacity = parseFloat(e.target.value) / 100;
-        });
-
-        scaleSlider.addEventListener("input", (e) => {
-            shadowScale = parseFloat(e.target.value) / 100;
-        });
-
-        // Resize handler to fit screen properly
+        // ─── Resize handler ───────────────────────────────────────────────────
         function resizeCanvas() {
-            canvas.width = window.innerWidth;
+            canvas.width  = window.innerWidth;
             canvas.height = window.innerHeight;
         }
         window.addEventListener('resize', resizeCanvas);
         resizeCanvas();
 
-        // Track manager to persist ID tracking between frames
+        // ─── ID tracker ───────────────────────────────────────────────────────
         function getPersistedId(currentX) {
             const now = Date.now();
-            // Clear old dead tracks (e.g., absent for more than 3 seconds)
             activeTracks = activeTracks.filter(t => now - t.lastSeen < 3000);
-            
-            // Find closest existing track
+
             let match = null;
-            let minDist = 0.15; // Max distance threshold to associate track (15% canvas width)
-            
+            let minDist = 0.15;
+
             activeTracks.forEach(track => {
                 const dist = Math.abs(track.x - currentX);
-                if (dist < minDist) {
-                    minDist = dist;
-                    match = track;
-                }
+                if (dist < minDist) { minDist = dist; match = track; }
             });
 
             if (match) {
@@ -514,171 +494,168 @@
             }
         }
 
-        // Draw shadow figurines (Masks & Skeletons)
+        // ─── Main render callback ─────────────────────────────────────────────
         function onPoseResults(results) {
-            // Clear canvas
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            if (!results || !results.poseLandmarks) {
-                return;
-            }
+            if (!results || !results.landmarks || results.landmarks.length === 0) return;
 
             ctx.save();
-            // Mirror coordinates for intuitive camera interaction
+            // Mirror for intuitive camera interaction
             ctx.translate(canvas.width, 0);
             ctx.scale(-1, 1);
 
             const scaleX = canvas.width;
             const scaleY = canvas.height;
-            const landmarks = results.poseLandmarks;
 
-            // Get center position of the person to scale around their body center
-            const xs = landmarks.map(l => l.x);
-            const ys = landmarks.map(l => l.y);
-            const centerX = xs.reduce((a, b) => a + b, 0) / landmarks.length;
-            const centerY = ys.reduce((a, b) => a + b, 0) / landmarks.length;
+            results.landmarks.forEach((landmarks, personIndex) => {
+                if (!landmarks || landmarks.length === 0) return;
 
-            // Persist the ID
-            const personId = getPersistedId(centerX);
+                const xs = landmarks.map(l => l.x);
+                const ys = landmarks.map(l => l.y);
+                const centerX = xs.reduce((a, b) => a + b, 0) / landmarks.length;
+                const centerY = ys.reduce((a, b) => a + b, 0) / landmarks.length;
 
-            // Apply custom scaling factor (scaled relative to body center)
-            const scaledLandmarks = landmarks.map(l => {
-                return {
+                const personId = getPersistedId(centerX);
+
+                const scaledLandmarks = landmarks.map(l => ({
                     x: centerX + (l.x - centerX) * shadowScale,
                     y: centerY + (l.y - centerY) * shadowScale,
                     visibility: l.visibility
-                };
-            });
+                }));
 
-            // Configure shadow aesthetics
-            ctx.shadowColor = 'rgba(10, 8, 5, 0.8)';
-            ctx.shadowBlur = shadowBlur;
-            ctx.filter = `blur(${shadowBlur}px)`;
-            ctx.fillStyle = `rgba(20, 18, 15, ${shadowOpacity})`;
-            ctx.strokeStyle = `rgba(20, 18, 15, ${shadowOpacity})`;
+                ctx.shadowColor = 'rgba(10, 8, 5, 0.8)';
+                ctx.shadowBlur  = shadowBlur;
+                ctx.filter      = `blur(${shadowBlur}px)`;
+                ctx.fillStyle   = `rgba(20, 18, 15, ${shadowOpacity})`;
+                ctx.strokeStyle = `rgba(20, 18, 15, ${shadowOpacity})`;
 
-            // Draw Silhouette Mask
-            if (results.segmentationMask) {
-                // Draw pixel-level binary mask from MediaPipe segmentation
-                ctx.save();
-                ctx.filter = `blur(${shadowBlur}px) grayscale(100%) brightness(0%) opacity(${shadowOpacity})`;
-                
-                // Create temporary canvas to scale and position the segmentation mask around center
-                const tempCanvas = document.createElement('canvas');
-                tempCanvas.width = canvas.width;
-                tempCanvas.height = canvas.height;
-                const tempCtx = tempCanvas.getContext('2d');
-                
-                // Draw segmentation mask stretched to full size first
-                tempCtx.drawImage(results.segmentationMask, 0, 0, canvas.width, canvas.height);
-                
-                // Apply scaling around center of gravity
-                ctx.translate(centerX * scaleX, centerY * scaleY);
-                ctx.scale(shadowScale, shadowScale);
-                ctx.translate(-centerX * scaleX, -centerY * scaleY);
-                
-                ctx.drawImage(tempCanvas, 0, 0);
-                ctx.restore();
-            } else {
-                // Fallback to organic thick skeleton silhouette if segmentation mask is absent
-                drawOrganicSilhouette(scaledLandmarks, scaleX, scaleY);
-            }
+                // ── Silhouette mask ──────────────────────────────────────────
+                const segMask = results.segmentationMasks ? results.segmentationMasks[personIndex] : null;
+                if (segMask) {
+                    ctx.save();
+                    ctx.filter = `blur(${shadowBlur}px) grayscale(100%) brightness(0%) opacity(${shadowOpacity})`;
 
-            // Draw Skeleton Joint lines
-            if (showSkeleton) {
-                ctx.save();
-                ctx.filter = `none`;
-                ctx.shadowBlur = 4;
-                ctx.lineWidth = 6;
-                ctx.strokeStyle = `rgba(10, 8, 5, ${shadowOpacity + 0.1})`;
-                ctx.fillStyle = `rgba(10, 8, 5, ${shadowOpacity + 0.1})`;
+                    const maskCanvas = document.createElement('canvas');
+                    maskCanvas.width  = segMask.width;
+                    maskCanvas.height = segMask.height;
+                    const maskCtx = maskCanvas.getContext('2d');
 
-                drawSkeletonJoints(scaledLandmarks, scaleX, scaleY);
-                ctx.restore();
-            }
+                    const floatData = segMask.getAsFloat32Array();
+                    const imgData   = maskCtx.createImageData(segMask.width, segMask.height);
+                    for (let i = 0; i < floatData.length; i++) {
+                        const v = floatData[i] > 0.5 ? 255 : 0;
+                        imgData.data[i * 4 + 0] = 0;
+                        imgData.data[i * 4 + 1] = 0;
+                        imgData.data[i * 4 + 2] = 0;
+                        imgData.data[i * 4 + 3] = v;
+                    }
+                    maskCtx.putImageData(imgData, 0, 0);
 
-            // Draw ID Text badge above the head (offset dynamically relative to nose coordinates)
-            if (showID) {
-                ctx.save();
-                ctx.filter = `none`;
-                ctx.shadowBlur = 0;
-                
-                const nose = scaledLandmarks[0];
-                if (nose) {
-                    const nx = nose.x * scaleX;
-                    const ny = nose.y * scaleY - 60; // Render badge 60px above nose
+                    const tempCanvas = document.createElement('canvas');
+                    tempCanvas.width  = canvas.width;
+                    tempCanvas.height = canvas.height;
+                    tempCanvas.getContext('2d').drawImage(maskCanvas, 0, 0, canvas.width, canvas.height);
 
-                    // Draw nice circular / rounded pill badge
-                    ctx.fillStyle = 'rgba(25, 23, 32, 0.9)';
-                    ctx.strokeStyle = 'rgba(220, 180, 120, 0.6)';
-                    ctx.lineWidth = 2;
-                    
-                    const text = `Person ${personId}`;
-                    ctx.font = 'bold 13px Outfit';
-                    const textWidth = ctx.measureText(text).width;
-                    
-                    // Draw rounded rect
-                    const px = nx - textWidth/2 - 12;
-                    const py = ny - 14;
-                    const pw = textWidth + 24;
-                    const ph = 26;
-                    const r = 13;
-                    
-                    ctx.beginPath();
-                    ctx.moveTo(px + r, py);
-                    ctx.lineTo(px + pw - r, py);
-                    ctx.quadraticCurveTo(px + pw, py, px + pw, py + r);
-                    ctx.lineTo(px + pw, py + ph - r);
-                    ctx.quadraticCurveTo(px + pw, py + ph, px + pw - r, py + ph);
-                    ctx.lineTo(px + r, py + ph);
-                    ctx.quadraticCurveTo(px, py + ph, px, py + ph - r);
-                    ctx.lineTo(px, py + r);
-                    ctx.quadraticCurveTo(px, py, px + r, py);
-                    ctx.closePath();
-                    
-                    ctx.fill();
-                    ctx.stroke();
-
-                    // Text (we scale label text back so it is readable, keeping it straight)
-                    ctx.scale(-1, 1);
-                    ctx.fillStyle = '#f3ece0';
-                    ctx.textAlign = 'center';
-                    ctx.fillText(text, -nx, ny + 4);
+                    ctx.translate(centerX * scaleX, centerY * scaleY);
+                    ctx.scale(shadowScale, shadowScale);
+                    ctx.translate(-centerX * scaleX, -centerY * scaleY);
+                    ctx.drawImage(tempCanvas, 0, 0);
+                    ctx.restore();
+                } else {
+                    drawOrganicSilhouette(scaledLandmarks, scaleX, scaleY);
                 }
-                ctx.restore();
-            }
+
+                // ── Skeleton ─────────────────────────────────────────────────
+                if (showSkeleton) {
+                    ctx.save();
+                    ctx.filter     = 'none';
+                    ctx.shadowBlur = 4;
+                    ctx.lineWidth  = 6;
+                    ctx.strokeStyle = `rgba(10, 8, 5, ${shadowOpacity + 0.1})`;
+                    ctx.fillStyle   = `rgba(10, 8, 5, ${shadowOpacity + 0.1})`;
+                    drawSkeletonJoints(scaledLandmarks, scaleX, scaleY);
+                    ctx.restore();
+                }
+
+                // ── Person ID badge ───────────────────────────────────────────
+                if (showID) {
+                    ctx.save();
+                    ctx.filter     = 'none';
+                    ctx.shadowBlur = 0;
+
+                    const nose = scaledLandmarks[0];
+                    if (nose) {
+                        const nx = nose.x * scaleX;
+                        const ny = nose.y * scaleY - 60;
+
+                        ctx.fillStyle   = 'rgba(25, 23, 32, 0.9)';
+                        ctx.strokeStyle = 'rgba(220, 180, 120, 0.6)';
+                        ctx.lineWidth   = 2;
+
+                        const text      = `Person ${personId}`;
+                        ctx.font        = 'bold 13px Outfit';
+                        const textWidth = ctx.measureText(text).width;
+
+                        const px = nx - textWidth / 2 - 12;
+                        const py = ny - 14;
+                        const pw = textWidth + 24;
+                        const ph = 26;
+                        const r  = 13;
+
+                        ctx.beginPath();
+                        ctx.moveTo(px + r, py);
+                        ctx.lineTo(px + pw - r, py);
+                        ctx.quadraticCurveTo(px + pw, py, px + pw, py + r);
+                        ctx.lineTo(px + pw, py + ph - r);
+                        ctx.quadraticCurveTo(px + pw, py + ph, px + pw - r, py + ph);
+                        ctx.lineTo(px + r, py + ph);
+                        ctx.quadraticCurveTo(px, py + ph, px, py + ph - r);
+                        ctx.lineTo(px, py + r);
+                        ctx.quadraticCurveTo(px, py, px + r, py);
+                        ctx.closePath();
+                        ctx.fill();
+                        ctx.stroke();
+
+                        // Flip text back so it reads correctly inside the mirrored context
+                        ctx.scale(-1, 1);
+                        ctx.fillStyle  = '#f3ece0';
+                        ctx.textAlign  = 'center';
+                        ctx.fillText(text, -nx, ny + 4);
+                    }
+                    ctx.restore();
+                }
+            });
 
             ctx.restore();
         }
 
-        // Helper to draw filled contour shape matching the body shape landmarks
+        // ─── Organic silhouette fallback ──────────────────────────────────────
         function drawOrganicSilhouette(landmarks, sx, sy) {
-            ctx.beginPath();
-
-            // Head circle
-            const nose = landmarks[0];
-            const leftEar = landmarks[7];
+            const nose     = landmarks[0];
+            const leftEar  = landmarks[7];
             const rightEar = landmarks[8];
             if (nose) {
                 const hx = nose.x * sx;
                 const hy = nose.y * sy;
                 let hr = 25;
                 if (leftEar && rightEar) {
-                    hr = Math.hypot((leftEar.x - rightEar.x)*sx, (leftEar.y - rightEar.y)*sy) * 0.8;
+                    hr = Math.hypot((leftEar.x - rightEar.x) * sx, (leftEar.y - rightEar.y) * sy) * 0.8;
                 }
+                ctx.beginPath();
                 ctx.arc(hx, hy, Math.max(hr, 18), 0, 2 * Math.PI);
                 ctx.fill();
             }
 
             const connections = [
-                [11, 12], [12, 24], [24, 23], [23, 11], // Torso
-                [11, 13], [13, 15], // Left Arm
-                [12, 14], [14, 16], // Right Arm
-                [23, 25], [25, 27], [27, 31], // Left Leg
-                [24, 26], [26, 28], [28, 32]  // Right Leg
+                [11, 12], [12, 24], [24, 23], [23, 11],
+                [11, 13], [13, 15],
+                [12, 14], [14, 16],
+                [23, 25], [25, 27], [27, 31],
+                [24, 26], [26, 28], [28, 32]
             ];
 
-            ctx.lineCap = 'round';
+            ctx.lineCap  = 'round';
             ctx.lineJoin = 'round';
 
             connections.forEach(([p1, p2]) => {
@@ -694,7 +671,7 @@
             });
         }
 
-        // Helper to draw skeleton bones
+        // ─── Skeleton joints ──────────────────────────────────────────────────
         function drawSkeletonJoints(landmarks, sx, sy) {
             const connections = [
                 [11, 12],
@@ -705,7 +682,7 @@
                 [24, 26], [26, 28]
             ];
 
-            ctx.lineCap = 'round';
+            ctx.lineCap  = 'round';
             ctx.lineJoin = 'round';
 
             connections.forEach(([p1, p2]) => {
