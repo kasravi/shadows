@@ -274,6 +274,7 @@
                 <div class="controls-vertical">
                     <button id="btnCamera" class="btn active">Start Camera</button>
                     <button id="toggleSkeleton" class="btn btn-toggle-active enabled">Skeleton: On</button>
+                    <button id="toggleID" class="btn btn-toggle-active enabled">Person ID: On</button>
                     <button id="toggleWallColor" class="btn">Warm Light</button>
                 </div>
             </div>
@@ -286,6 +287,11 @@
             <div class="setting-group">
                 <label for="densitySlider">Shadow Opacity</label>
                 <input type="range" id="densitySlider" min="10" max="100" value="90">
+            </div>
+
+            <div class="setting-group">
+                <label for="scaleSlider">Shadow Scale</label>
+                <input type="range" id="scaleSlider" min="50" max="200" value="100">
             </div>
 
             <div class="setting-group" style="margin-top: 12px;">
@@ -312,15 +318,21 @@
         const statusText = document.getElementById('statusText');
         const cardText = document.getElementById('cardText');
         const toggleSkeletonBtn = document.getElementById('toggleSkeleton');
+        const toggleIDBtn = document.getElementById('toggleID');
         const toggleWallColorBtn = document.getElementById('toggleWallColor');
         const blurSlider = document.getElementById('blurSlider');
         const densitySlider = document.getElementById('densitySlider');
+        const scaleSlider = document.getElementById('scaleSlider');
         const menuBtn = document.getElementById('menuBtn');
         const sidePanel = document.getElementById('sidePanel');
 
         let pose;
         let camera = null;
         let webcamRunning = false;
+
+        // Track memory to persist Person IDs across frames using horizontal coordinates (X)
+        let activeTracks = []; // array of { x: number, id: number, lastSeen: number }
+        let nextTrackId = 1;
 
         // Toggle Right Panel
         menuBtn.addEventListener('click', () => {
@@ -330,9 +342,11 @@
 
         // Customization states
         let showSkeleton = true;
+        let showID = true;
         let wallWarmTheme = false;
         let shadowBlur = 12;
         let shadowOpacity = 0.9;
+        let shadowScale = 1.0;
 
         // Initialize MediaPipe Pose
         function initPose() {
@@ -429,6 +443,17 @@
             }
         });
 
+        toggleIDBtn.addEventListener("click", () => {
+            showID = !showID;
+            if (showID) {
+                toggleIDBtn.innerText = "Person ID: On";
+                toggleIDBtn.classList.add('enabled');
+            } else {
+                toggleIDBtn.innerText = "Person ID: Off";
+                toggleIDBtn.classList.remove('enabled');
+            }
+        });
+
         toggleWallColorBtn.addEventListener("click", () => {
             wallWarmTheme = !wallWarmTheme;
             if (wallWarmTheme) {
@@ -448,6 +473,10 @@
             shadowOpacity = parseFloat(e.target.value) / 100;
         });
 
+        scaleSlider.addEventListener("input", (e) => {
+            shadowScale = parseFloat(e.target.value) / 100;
+        });
+
         // Resize handler to fit screen properly
         function resizeCanvas() {
             canvas.width = window.innerWidth;
@@ -455,6 +484,35 @@
         }
         window.addEventListener('resize', resizeCanvas);
         resizeCanvas();
+
+        // Track manager to persist ID tracking between frames
+        function getPersistedId(currentX) {
+            const now = Date.now();
+            // Clear old dead tracks (e.g., absent for more than 3 seconds)
+            activeTracks = activeTracks.filter(t => now - t.lastSeen < 3000);
+            
+            // Find closest existing track
+            let match = null;
+            let minDist = 0.15; // Max distance threshold to associate track (15% canvas width)
+            
+            activeTracks.forEach(track => {
+                const dist = Math.abs(track.x - currentX);
+                if (dist < minDist) {
+                    minDist = dist;
+                    match = track;
+                }
+            });
+
+            if (match) {
+                match.x = currentX;
+                match.lastSeen = now;
+                return match.id;
+            } else {
+                const newId = nextTrackId++;
+                activeTracks.push({ x: currentX, id: newId, lastSeen: now });
+                return newId;
+            }
+        }
 
         // Draw shadow figurines (Masks & Skeletons)
         function onPoseResults(results) {
@@ -474,6 +532,24 @@
             const scaleY = canvas.height;
             const landmarks = results.poseLandmarks;
 
+            // Get center position of the person to scale around their body center
+            const xs = landmarks.map(l => l.x);
+            const ys = landmarks.map(l => l.y);
+            const centerX = xs.reduce((a, b) => a + b, 0) / landmarks.length;
+            const centerY = ys.reduce((a, b) => a + b, 0) / landmarks.length;
+
+            // Persist the ID
+            const personId = getPersistedId(centerX);
+
+            // Apply custom scaling factor (scaled relative to body center)
+            const scaledLandmarks = landmarks.map(l => {
+                return {
+                    x: centerX + (l.x - centerX) * shadowScale,
+                    y: centerY + (l.y - centerY) * shadowScale,
+                    visibility: l.visibility
+                };
+            });
+
             // Configure shadow aesthetics
             ctx.shadowColor = 'rgba(10, 8, 5, 0.8)';
             ctx.shadowBlur = shadowBlur;
@@ -483,22 +559,29 @@
 
             // Draw Silhouette Mask
             if (results.segmentationMask) {
-                // If segmentation mask exists, draw it using composition to generate pixel-level shadow
+                // Draw pixel-level binary mask from MediaPipe segmentation
                 ctx.save();
                 ctx.filter = `blur(${shadowBlur}px) grayscale(100%) brightness(0%) opacity(${shadowOpacity})`;
                 
-                // Create temporary canvas to mirror & stretch mask to fit screen size
+                // Create temporary canvas to scale and position the segmentation mask around center
                 const tempCanvas = document.createElement('canvas');
-                tempCanvas.width = results.segmentationMask.width;
-                tempCanvas.height = results.segmentationMask.height;
+                tempCanvas.width = canvas.width;
+                tempCanvas.height = canvas.height;
                 const tempCtx = tempCanvas.getContext('2d');
-                tempCtx.drawImage(results.segmentationMask, 0, 0);
                 
-                ctx.drawImage(tempCanvas, 0, 0, scaleX, scaleY);
+                // Draw segmentation mask stretched to full size first
+                tempCtx.drawImage(results.segmentationMask, 0, 0, canvas.width, canvas.height);
+                
+                // Apply scaling around center of gravity
+                ctx.translate(centerX * scaleX, centerY * scaleY);
+                ctx.scale(shadowScale, shadowScale);
+                ctx.translate(-centerX * scaleX, -centerY * scaleY);
+                
+                ctx.drawImage(tempCanvas, 0, 0);
                 ctx.restore();
             } else {
-                // Fallback to organic thick skeleton silhouette if segmentation mask is loading/absent
-                drawOrganicSilhouette(landmarks, scaleX, scaleY);
+                // Fallback to organic thick skeleton silhouette if segmentation mask is absent
+                drawOrganicSilhouette(scaledLandmarks, scaleX, scaleY);
             }
 
             // Draw Skeleton Joint lines
@@ -510,7 +593,58 @@
                 ctx.strokeStyle = `rgba(10, 8, 5, ${shadowOpacity + 0.1})`;
                 ctx.fillStyle = `rgba(10, 8, 5, ${shadowOpacity + 0.1})`;
 
-                drawSkeletonJoints(landmarks, scaleX, scaleY);
+                drawSkeletonJoints(scaledLandmarks, scaleX, scaleY);
+                ctx.restore();
+            }
+
+            // Draw ID Text badge above the head (offset dynamically relative to nose coordinates)
+            if (showID) {
+                ctx.save();
+                ctx.filter = `none`;
+                ctx.shadowBlur = 0;
+                
+                const nose = scaledLandmarks[0];
+                if (nose) {
+                    const nx = nose.x * scaleX;
+                    const ny = nose.y * scaleY - 60; // Render badge 60px above nose
+
+                    // Draw nice circular / rounded pill badge
+                    ctx.fillStyle = 'rgba(25, 23, 32, 0.9)';
+                    ctx.strokeStyle = 'rgba(220, 180, 120, 0.6)';
+                    ctx.lineWidth = 2;
+                    
+                    const text = `Person ${personId}`;
+                    ctx.font = 'bold 13px Outfit';
+                    const textWidth = ctx.measureText(text).width;
+                    
+                    // Draw rounded rect
+                    const px = nx - textWidth/2 - 12;
+                    const py = ny - 14;
+                    const pw = textWidth + 24;
+                    const ph = 26;
+                    const r = 13;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(px + r, py);
+                    ctx.lineTo(px + pw - r, py);
+                    ctx.quadraticCurveTo(px + pw, py, px + pw, py + r);
+                    ctx.lineTo(px + pw, py + ph - r);
+                    ctx.quadraticCurveTo(px + pw, py + ph, px + pw - r, py + ph);
+                    ctx.lineTo(px + r, py + ph);
+                    ctx.quadraticCurveTo(px, py + ph, px, py + ph - r);
+                    ctx.lineTo(px, py + r);
+                    ctx.quadraticCurveTo(px, py, px + r, py);
+                    ctx.closePath();
+                    
+                    ctx.fill();
+                    ctx.stroke();
+
+                    // Text (we scale label text back so it is readable, keeping it straight)
+                    ctx.scale(-1, 1);
+                    ctx.fillStyle = '#f3ece0';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(text, -nx, ny + 4);
+                }
                 ctx.restore();
             }
 
