@@ -562,6 +562,8 @@
                     ctx.translate(-centerX * scaleX, -centerY * scaleY);
                     ctx.drawImage(tempCanvas, 0, 0);
                     ctx.restore();
+                    // Release the WebGL texture backing this MPMask to prevent resource leak
+                    segMask.close();
                 } else {
                     drawOrganicSilhouette(scaledLandmarks, scaleX, scaleY);
                 }
